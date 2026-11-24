@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.0 - 2026-11-24
 
 - `safe-retry` middleware: replays stored responses for repeated `Idempotency-Key`s, returns 409 while a request with the same key is in flight, and 422 when a key is reused with a different payload.
 - Cache, Redis and Database stores.
