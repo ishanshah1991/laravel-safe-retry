@@ -25,7 +25,7 @@ Keys are scoped to the authenticated user by default, so two users can never col
 ## Requirements
 
 - PHP 8.2+
-- Laravel 11, 12 or 13
+- Laravel 12 or 13
 
 ## Installation
 
