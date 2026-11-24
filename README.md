@@ -1,5 +1,11 @@
 # laravel-safe-retry
 
+[![Latest Version on Packagist](https://img.shields.io/packagist/v/ishanshah1991/laravel-safe-retry.svg)](https://packagist.org/packages/ishanshah1991/laravel-safe-retry)
+[![Tests](https://github.com/ishanshah1991/laravel-safe-retry/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/ishanshah1991/laravel-safe-retry/actions/workflows/tests.yml)
+[![Total Downloads](https://img.shields.io/packagist/dt/ishanshah1991/laravel-safe-retry.svg)](https://packagist.org/packages/ishanshah1991/laravel-safe-retry)
+[![PHP Version](https://img.shields.io/packagist/dependency-v/ishanshah1991/laravel-safe-retry/php.svg)](https://packagist.org/packages/ishanshah1991/laravel-safe-retry)
+[![License](https://img.shields.io/packagist/l/ishanshah1991/laravel-safe-retry.svg)](LICENSE)
+
 Make your Laravel API endpoints safe to retry. Prevents duplicate charges, double orders, and repeat side effects using idempotency keys - backed by Redis, Database, or Cache.
 
 A client sends a unique `Idempotency-Key` header with a request. If the network drops and the client retries with the same key, your route does **not** run again: the client gets the response from the first attempt.
