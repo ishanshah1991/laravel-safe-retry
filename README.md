@@ -33,10 +33,10 @@ Keys are scoped to the authenticated user by default, so two users can never col
 composer require ishanshah1991/laravel-safe-retry
 ```
 
-Optionally publish the config:
+Optionally publish the config (add `--database` to also publish the migration for the database store):
 
 ```bash
-php artisan vendor:publish --tag=safe-retry-config
+php artisan safe-retry:install
 ```
 
 ## Usage
@@ -48,6 +48,22 @@ Route::post('/orders', [OrderController::class, 'store'])->middleware(['auth:san
 ```
 
 Put it **after** your auth middleware, so keys can be scoped to the user.
+
+Or use the route macro:
+
+```php
+Route::post('/orders', [OrderController::class, 'store'])->safeRetry();
+Route::post('/payments', [PaymentController::class, 'store'])->safeRetry('required', 'ttl=3600');
+
+// For groups, build the middleware string:
+use IshanShah\SafeRetry\Http\Middleware\SafeRetry;
+
+Route::middleware(['auth:sanctum', SafeRetry::using('required')])->group(function () {
+    // ...
+});
+```
+
+Inside your controller, `$request->idempotencyKey()` returns the key the client sent, for example to store it on the order you create.
 
 ### Per-route options
 
@@ -79,6 +95,20 @@ await fetch('/api/orders', {
   headers: { 'Idempotency-Key': key, 'Content-Type': 'application/json' },
   body: JSON.stringify(order),
 });
+```
+
+### Calling other APIs: `Http::withIdempotencyKey()`
+
+The package also helps when *your* app is the client. `withIdempotencyKey()` adds an `Idempotency-Key` header (a fresh UUID unless you pass one), and Laravel sends the same header on every `retry()`:
+
+```php
+Http::withIdempotencyKey()->retry(3, 200)->post('https://api.stripe.com/v1/charges', $data);
+
+// Your own key, so it is also the same across queue job retries
+Http::withIdempotencyKey("order-{$order->id}")->post($url, $data);
+
+// A different header name
+Http::withIdempotencyKey($key, 'X-Idempotency-Key')->post($url, $data);
 ```
 
 ## Stores
@@ -133,7 +163,42 @@ use IshanShah\SafeRetry\Facades\SafeRetry;
 SafeRetry::extend('dynamo', fn ($app) => new MyDynamoStore(/* ... */));
 ```
 
-## Idempotent jobs and other code: `SafeRetry::once()`
+## Encryption
+
+Stored responses can contain personal or payment data. Encrypt them at rest with your `APP_KEY`:
+
+```env
+SAFE_RETRY_ENCRYPT=true
+```
+
+This works with every store. If `APP_KEY` changes, old records can't be read, and those keys behave as new.
+
+## Queued jobs: `SafeRetryJob` middleware
+
+Queues deliver at least once, so a job can run twice. Add the job middleware to make its work happen only once per key:
+
+```php
+use IshanShah\SafeRetry\Jobs\SafeRetryJob;
+
+class ChargeOrder implements ShouldQueue
+{
+    use Queueable, InteractsWithQueue;
+
+    public function middleware(): array
+    {
+        return [new SafeRetryJob("charge-order:{$this->order->id}")];
+    }
+}
+```
+
+- After a job with the key finishes, later jobs with that key are skipped (removed from the queue without running).
+- While one is running, a duplicate is released back onto the queue (after `jobs.release_after` seconds, 10 by default).
+- If the job throws, fails or releases itself, it is **not** marked done, so its retry runs again.
+- Without a key, it uses the job's `safeRetryKey()` method if it has one, otherwise the queued message's UUID (which guards against the same message being delivered twice).
+- Options: `SafeRetryJob::make($key)->ttl(3600)->releaseAfter(30)->store('redis')`.
+- `SafeRetry::hasJob($key)` and `SafeRetry::forgetJob($key)` check or reset a key.
+
+## Any code: `SafeRetry::once()`
 
 Not every side effect comes from an HTTP request. `once()` runs a callback at most once per key and returns the stored result after that:
 
@@ -155,7 +220,36 @@ class ChargeOrder implements ShouldQueue
 - If another process is running the same key right now, `IdempotencyKeyInUseException` is thrown. In a queued job, let it fail so the job is retried later.
 - Results are stored with `serialize()`, so return plain values or serializable objects.
 - `SafeRetry::once($key, $callback, ttl: 3600, store: 'redis')` overrides the TTL and store.
-- `SafeRetry::forgetOnce($key)` makes it run again.
+- `SafeRetry::hasOnce($key)` tells you whether it has run; `SafeRetry::forgetOnce($key)` makes it run again.
+
+## Scoping keys
+
+By default a key belongs to the logged-in user (and to nobody for guests). To scope by something else, like a tenant or API client, register a resolver in a service provider's `boot()` method:
+
+```php
+use IshanShah\SafeRetry\Facades\SafeRetry;
+
+SafeRetry::scopeUsing(fn (Request $request) => $request->header('X-Tenant-Id'));
+```
+
+Set `scope_by_user` to `false` to share keys across all users.
+
+## Inspecting and resetting keys
+
+```php
+SafeRetry::findRequest($key, $user);    // the stored record, or null
+SafeRetry::forgetRequest($key, $user);  // the next request with this key runs again
+SafeRetry::forgetRequest($key, 'tenant-42');  // with a custom scope
+```
+
+From the command line:
+
+```bash
+php artisan safe-retry:forget 7f3a-key --user=15
+php artisan safe-retry:forget 7f3a-key --scope=tenant-42
+php artisan safe-retry:forget charge-order:15 --once
+php artisan safe-retry:forget charge-order:15 --job
+```
 
 ## Configuration
 
@@ -171,14 +265,32 @@ See [config/safe-retry.php](config/safe-retry.php) for every option. The main on
 | `ttl` | `86400` | Seconds a response is replayed |
 | `lock_timeout` | `60` | Seconds the in-flight lock lasts (should exceed your slowest request) |
 | `wait` | `0` | Seconds a duplicate waits for the original |
+| `max_key_length` | `255` | Longer keys are rejected with 400 |
+| `key_pattern` | `null` | Regex keys must match (e.g. UUIDs only) |
 | `scope_by_user` | `true` | Scope keys to the authenticated user |
 | `store_server_errors` | `false` | Replay 5xx responses too |
 | `excluded_headers` | `set-cookie, date` | Headers never stored or replayed |
+| `max_response_size` | `null` | Larger bodies (bytes) are not stored |
+| `encrypt` | `false` | Encrypt stored records with `APP_KEY` |
+| `echo_key` | `false` | Send the key back in the response's `Idempotency-Key` header |
 | `fingerprinter` | `DefaultFingerprinter` | Decides what counts as "the same request" |
+| `fingerprint.ignore` | `[]` | Body fields left out of the fingerprint |
+| `fingerprint.headers` | `[]` | Request headers included in the fingerprint |
+| `jobs.ttl` | `86400` | Seconds a finished job key is remembered |
+| `jobs.release_after` | `10` | Seconds before a running duplicate job is retried |
 
 ### What counts as the same request
 
-The default fingerprinter hashes the method, path, query string and body (for form and multipart requests: the fields and uploaded file contents). To change it, for example to ignore a field that changes between retries, implement `IshanShah\SafeRetry\Contracts\Fingerprinter` and set `fingerprinter` in the config.
+The default fingerprinter hashes the method, path, query string and body. JSON and form bodies are compared by value, so key order and whitespace don't matter; for multipart requests the uploaded files' contents count.
+
+```php
+'fingerprint' => [
+    'ignore' => ['meta.sent_at'],   // a client timestamp that changes on each retry
+    'headers' => ['X-Currency'],    // a header that changes what the request means
+],
+```
+
+For full control, implement `IshanShah\SafeRetry\Contracts\Fingerprinter` and set `fingerprinter` in the config.
 
 ## Errors
 
@@ -201,7 +313,26 @@ Errors are thrown as HTTP exceptions, so Laravel renders them with the right sta
 
 ## Events
 
-`IshanShah\SafeRetry\Events\ResponseReplayed` fires whenever a response is replayed. It carries the `request`, `response` and `idempotencyKey`, which is useful for logging and metrics.
+All in `IshanShah\SafeRetry\Events`, useful for logging and metrics:
+
+| Event | When | Properties |
+| --- | --- | --- |
+| `ResponseStored` | A response was saved for replay | `request`, `response`, `idempotencyKey` |
+| `ResponseReplayed` | A retry was answered from the stored response | `request`, `response`, `idempotencyKey` |
+| `IdempotencyKeyInUse` | A duplicate was rejected with 409 | `request`, `idempotencyKey` |
+| `IdempotencyKeyMismatched` | A key was reused for a different request (422) | `request`, `idempotencyKey` |
+| `DuplicateJobSkipped` | `SafeRetryJob` skipped a job that already ran | `job`, `key` |
+
+## Testing your app
+
+The package adds assertions to Laravel's test responses:
+
+```php
+$this->postJson('/orders', $data, ['Idempotency-Key' => 'k'])->assertCreated()->assertNotReplayed();
+$this->postJson('/orders', $data, ['Idempotency-Key' => 'k'])->assertCreated()->assertReplayed();
+```
+
+In tests, `SAFE_RETRY_STORE=cache` with the `array` cache driver needs no setup.
 
 ## Notes
 
@@ -209,7 +340,7 @@ Errors are thrown as HTTP exceptions, so Laravel renders them with the right sta
 - Cookies (`Set-Cookie`) are not replayed by default.
 - Pick `lock_timeout` longer than your slowest request. If a request crashes, its lock expires after this time and the key can be used again.
 
-## Testing
+## Running the package's tests
 
 ```bash
 composer test

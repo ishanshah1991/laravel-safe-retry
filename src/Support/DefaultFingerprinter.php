@@ -2,12 +2,32 @@
 
 namespace IshanShah\SafeRetry\Support;
 
+use Illuminate\Contracts\Config\Repository as Config;
 use Illuminate\Http\Request;
 use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Arr;
 use IshanShah\SafeRetry\Contracts\Fingerprinter;
 
+/**
+ * Hashes the method, path, query string, body and any configured headers.
+ *
+ * JSON and form bodies are compared by value, so key order and whitespace
+ * don't matter. Fields listed in safe-retry.fingerprint.ignore are left out.
+ */
 class DefaultFingerprinter implements Fingerprinter
 {
+    /** @var array<int, string> */
+    protected array $ignore;
+
+    /** @var array<int, string> */
+    protected array $headers;
+
+    public function __construct(?Config $config = null)
+    {
+        $this->ignore = (array) ($config?->get('safe-retry.fingerprint.ignore') ?? []);
+        $this->headers = (array) ($config?->get('safe-retry.fingerprint.headers') ?? []);
+    }
+
     public function fingerprint(Request $request): string
     {
         $query = $request->query();
@@ -18,6 +38,7 @@ class DefaultFingerprinter implements Fingerprinter
             '/'.ltrim($request->path(), '/'),
             json_encode($query),
             hash('sha256', $this->body($request)),
+            json_encode($this->headerValues($request)),
         ];
 
         return hash('sha256', implode('|', $parts));
@@ -25,29 +46,79 @@ class DefaultFingerprinter implements Fingerprinter
 
     protected function body(Request $request): string
     {
-        // Form and multipart requests have no raw content we can rely on
-        // (multipart boundaries change on every send), so hash the parsed input.
-        $content = $request->getContent();
-
-        if ($content !== '' && $request->files->count() === 0 && ! $this->isForm($request)) {
-            return $content;
+        if ($request->files->count() > 0 || $this->isForm($request)) {
+            return $this->formBody($request);
         }
 
-        $input = $request->request->all();
-        $this->sortRecursive($input);
+        $content = $request->getContent();
 
+        if ($content === '') {
+            return '';
+        }
+
+        if ($request->isJson()) {
+            $decoded = json_decode($content, true);
+
+            if (is_array($decoded)) {
+                return $this->encode($decoded);
+            }
+        }
+
+        return $content;
+    }
+
+    /**
+     * Multipart boundaries change on every send, so the raw content can't be
+     * compared. Hash the parsed fields and the uploaded files' contents.
+     */
+    protected function formBody(Request $request): string
+    {
         $files = [];
         foreach ($request->allFiles() as $name => $file) {
             $files[$name] = $this->hashFiles($file);
         }
-        $this->sortRecursive($files);
 
-        return json_encode([$input, $files]) ?: '';
+        return $this->encode(['input' => $request->request->all(), 'files' => $files]);
+    }
+
+    /**
+     * @param  array<mixed>  $data
+     */
+    protected function encode(array $data): string
+    {
+        if (isset($data['input']) && is_array($data['input'])) {
+            Arr::forget($data['input'], $this->ignore);
+        } else {
+            Arr::forget($data, $this->ignore);
+        }
+
+        $this->sortRecursive($data);
+
+        return (string) json_encode($data);
+    }
+
+    /**
+     * @return array<string, string|null>
+     */
+    protected function headerValues(Request $request): array
+    {
+        $values = [];
+
+        foreach ($this->headers as $header) {
+            $values[strtolower($header)] = $request->headers->get($header);
+        }
+
+        ksort($values);
+
+        return $values;
     }
 
     protected function isForm(Request $request): bool
     {
-        return str_starts_with((string) $request->headers->get('CONTENT_TYPE'), 'application/x-www-form-urlencoded');
+        $type = (string) $request->headers->get('CONTENT_TYPE');
+
+        return str_starts_with($type, 'application/x-www-form-urlencoded')
+            || str_starts_with($type, 'multipart/form-data');
     }
 
     /**
@@ -64,6 +135,8 @@ class DefaultFingerprinter implements Fingerprinter
     }
 
     /**
+     * Sort maps by key so order doesn't matter. Lists keep their order.
+     *
      * @param  array<mixed>  $array
      */
     protected function sortRecursive(array &$array): void
@@ -74,6 +147,8 @@ class DefaultFingerprinter implements Fingerprinter
             }
         }
 
-        ksort($array);
+        if (! array_is_list($array)) {
+            ksort($array);
+        }
     }
 }

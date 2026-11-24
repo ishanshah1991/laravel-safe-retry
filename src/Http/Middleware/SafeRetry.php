@@ -6,9 +6,13 @@ use Closure;
 use Illuminate\Contracts\Config\Repository as Config;
 use Illuminate\Contracts\Container\Container;
 use Illuminate\Http\Request;
+use InvalidArgumentException;
 use IshanShah\SafeRetry\Contracts\Fingerprinter;
 use IshanShah\SafeRetry\Contracts\Store;
+use IshanShah\SafeRetry\Events\IdempotencyKeyInUse;
+use IshanShah\SafeRetry\Events\IdempotencyKeyMismatched;
 use IshanShah\SafeRetry\Events\ResponseReplayed;
+use IshanShah\SafeRetry\Events\ResponseStored;
 use IshanShah\SafeRetry\Exceptions\IdempotencyKeyInUseException;
 use IshanShah\SafeRetry\Exceptions\IdempotencyKeyMismatchException;
 use IshanShah\SafeRetry\Exceptions\InvalidIdempotencyKeyException;
@@ -22,17 +26,29 @@ use Symfony\Component\HttpFoundation\Response;
  *   ->middleware('safe-retry')
  *   ->middleware('safe-retry:required')
  *   ->middleware('safe-retry:required,ttl=3600,store=redis,wait=5')
+ *   ->safeRetry('required', 'ttl=3600')
  *
  * Options: required, optional, ttl=<seconds>, store=<name>, wait=<seconds>,
  * lock=<seconds>.
  */
 class SafeRetry
 {
+    /** Request attribute holding the idempotency key, once validated. */
+    public const KEY_ATTRIBUTE = 'safe_retry.key';
+
     public function __construct(
         protected SafeRetryManager $manager,
         protected Config $config,
         protected Container $container,
     ) {}
+
+    /**
+     * Build the middleware string for a route, e.g. SafeRetry::using('required', 'ttl=60').
+     */
+    public static function using(string ...$options): string
+    {
+        return $options === [] ? 'safe-retry' : 'safe-retry:'.implode(',', $options);
+    }
 
     public function handle(Request $request, Closure $next, string ...$options): Response
     {
@@ -44,7 +60,7 @@ class SafeRetry
             return $next($request);
         }
 
-        $header = (string) $this->config->get('safe-retry.header', 'Idempotency-Key');
+        $header = $this->header();
         $key = $request->headers->get($header);
 
         if ($key === null || $key === '') {
@@ -55,14 +71,12 @@ class SafeRetry
             return $next($request);
         }
 
-        $maxLength = (int) $this->config->get('safe-retry.max_key_length', 255);
+        $this->validateKey($key, $header);
 
-        if (strlen($key) > $maxLength || trim($key) === '') {
-            throw new InvalidIdempotencyKeyException($header, $maxLength);
-        }
+        $request->attributes->set(self::KEY_ATTRIBUTE, $key);
 
         $store = $this->manager->store($options['store']);
-        $storageKey = $this->storageKey($request, $key);
+        $storageKey = $this->manager->requestKey($key, $this->manager->resolveScope($request));
         $fingerprint = $this->fingerprinter()->fingerprint($request);
 
         if ($replay = $this->replay($store, $storageKey, $fingerprint, $request, $key)) {
@@ -77,6 +91,8 @@ class SafeRetry
             if ($replay = $this->replay($store, $storageKey, $fingerprint, $request, $key)) {
                 return $replay;
             }
+
+            $this->dispatch(new IdempotencyKeyInUse($request, $key));
 
             throw new IdempotencyKeyInUseException;
         }
@@ -96,11 +112,23 @@ class SafeRetry
                     $this->serializer()->serialize($response, $fingerprint),
                     $options['ttl'],
                 );
+
+                $this->dispatch(new ResponseStored($request, $response, $key));
             }
 
-            return $response;
+            return $this->echoKey($response, $key);
         } finally {
             $store->releaseLock($storageKey, $owner);
+        }
+    }
+
+    protected function validateKey(string $key, string $header): void
+    {
+        $maxLength = (int) $this->config->get('safe-retry.max_key_length', 255);
+        $pattern = $this->config->get('safe-retry.key_pattern');
+
+        if (strlen($key) > $maxLength || trim($key) === '' || ($pattern && ! preg_match($pattern, $key))) {
+            throw new InvalidIdempotencyKeyException($header, $maxLength);
         }
     }
 
@@ -113,15 +141,17 @@ class SafeRetry
         }
 
         if (! hash_equals((string) $record['fingerprint'], $fingerprint)) {
+            $this->dispatch(new IdempotencyKeyMismatched($request, $key));
+
             throw new IdempotencyKeyMismatchException;
         }
 
         $response = $this->serializer()->unserialize($record);
         $response->headers->set((string) $this->config->get('safe-retry.replayed_header', 'Idempotent-Replayed'), 'true');
 
-        $this->container->make('events')->dispatch(new ResponseReplayed($request, $response, $key));
+        $this->dispatch(new ResponseReplayed($request, $response, $key));
 
-        return $response;
+        return $this->echoKey($response, $key);
     }
 
     /**
@@ -154,18 +184,32 @@ class SafeRetry
             return false;
         }
 
-        return $this->serializer()->canSerialize($response);
-    }
-
-    protected function storageKey(Request $request, string $key): string
-    {
-        $scope = 'global';
-
-        if ($this->config->get('safe-retry.scope_by_user', true) && ($user = $request->user())) {
-            $scope = get_class($user).':'.$user->getAuthIdentifier();
+        if (! $this->serializer()->canSerialize($response)) {
+            return false;
         }
 
-        return hash('sha256', 'http|'.$scope.'|'.$key);
+        $maxSize = $this->config->get('safe-retry.max_response_size');
+
+        return $maxSize === null || strlen((string) $response->getContent()) <= (int) $maxSize;
+    }
+
+    protected function echoKey(Response $response, string $key): Response
+    {
+        if ($this->config->get('safe-retry.echo_key', false)) {
+            $response->headers->set($this->header(), $key);
+        }
+
+        return $response;
+    }
+
+    protected function header(): string
+    {
+        return (string) $this->config->get('safe-retry.header', 'Idempotency-Key');
+    }
+
+    protected function dispatch(object $event): void
+    {
+        $this->container->make('events')->dispatch($event);
     }
 
     protected function fingerprinter(): Fingerprinter
@@ -200,7 +244,7 @@ class SafeRetry
                 'optional' => $parsed['required'] = false,
                 'ttl', 'wait', 'lock' => $parsed[$name] = (int) $value,
                 'store' => $parsed['store'] = $value,
-                default => throw new \InvalidArgumentException("Unknown safe-retry middleware option [{$option}]."),
+                default => throw new InvalidArgumentException("Unknown safe-retry middleware option [{$option}]."),
             };
         }
 

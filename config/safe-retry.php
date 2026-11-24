@@ -87,6 +87,10 @@ return [
     // Keys longer than this are rejected with 400.
     'max_key_length' => 255,
 
+    // Optional regex keys must match, or the request is rejected with 400.
+    // For example, UUIDs only: '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i'
+    'key_pattern' => null,
+
     // Scope keys to the authenticated user, so two users sending the same
     // key never collide or see each other's responses.
     'scope_by_user' => true,
@@ -97,6 +101,20 @@ return [
 
     // Response headers that are never stored or replayed.
     'excluded_headers' => ['set-cookie', 'date'],
+
+    // Responses with a body larger than this (bytes) are not stored, so a
+    // retry runs again. Null means no limit. Mind your store's value size
+    // limit (memcached: 1 MB by default).
+    'max_response_size' => null,
+
+    // Encrypt stored records with your APP_KEY. Turn on if responses hold
+    // personal or payment data. Records become unreadable if APP_KEY changes,
+    // which makes those keys behave as new.
+    'encrypt' => env('SAFE_RETRY_ENCRYPT', false),
+
+    // Add the request's idempotency key to every response it gets (the
+    // original and replays), under the same header name.
+    'echo_key' => false,
 
     /*
     |--------------------------------------------------------------------------
@@ -110,5 +128,32 @@ return [
     */
 
     'fingerprinter' => DefaultFingerprinter::class,
+
+    'fingerprint' => [
+        // Body fields (dot notation) left out of the fingerprint, for values
+        // that change between retries such as client timestamps.
+        'ignore' => [],
+
+        // Request headers that are part of the fingerprint.
+        'headers' => [],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Queued Jobs
+    |--------------------------------------------------------------------------
+    |
+    | Used by the IshanShah\SafeRetry\Jobs\SafeRetryJob job middleware.
+    |
+    */
+
+    'jobs' => [
+        // How long a finished job is remembered, so duplicates are skipped.
+        'ttl' => 60 * 60 * 24,
+
+        // When a duplicate runs while the original is still running, release
+        // it back onto the queue after this many seconds.
+        'release_after' => 10,
+    ],
 
 ];
