@@ -1,0 +1,57 @@
+{
+    "name": "ishanshah1991/laravel-safe-retry",
+    "description": "Make your Laravel API endpoints safe to retry. Prevents duplicate charges, double orders, and repeat side effects using idempotency keys - backed by Redis, Database, or Cache.",
+    "keywords": ["laravel", "idempotency", "idempotency-key", "retry", "middleware", "api", "redis"],
+    "license": "MIT",
+    "type": "library",
+    "authors": [
+        {
+            "name": "ishanshah1991",
+            "homepage": "https://github.com/ishanshah1991"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "illuminate/cache": "^11.0|^12.0|^13.0",
+        "illuminate/contracts": "^11.0|^12.0|^13.0",
+        "illuminate/database": "^11.0|^12.0|^13.0",
+        "illuminate/http": "^11.0|^12.0|^13.0",
+        "illuminate/support": "^11.0|^12.0|^13.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^9.0|^10.0|^11.0",
+        "phpunit/phpunit": "^10.5|^11.0|^12.0"
+    },
+    "suggest": {
+        "ext-redis": "Required to use the redis store with the phpredis client.",
+        "predis/predis": "Required to use the redis store with the predis client."
+    },
+    "autoload": {
+        "psr-4": {
+            "IshanShah\\SafeRetry\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "IshanShah\\SafeRetry\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "vendor/bin/phpunit"
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "IshanShah\\SafeRetry\\SafeRetryServiceProvider"
+            ],
+            "aliases": {
+                "SafeRetry": "IshanShah\\SafeRetry\\Facades\\SafeRetry"
+            }
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
